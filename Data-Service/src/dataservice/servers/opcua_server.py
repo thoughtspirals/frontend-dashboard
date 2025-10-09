@@ -1,0 +1,278 @@
+import os
+import asyncio
+from dotenv import load_dotenv
+from asyncua import Server, ua
+from threading import Event
+import re
+import aiohttp
+import json
+
+# Load environment variables
+load_dotenv()
+
+def parse_node_id(node_id_str: str):
+    """Parse node ID string to extract namespace and identifier"""
+    # Examples: "ns=2;i=100", "ns=2;s=Temperature", "i=100", "s=Temperature"
+    ns = 2  # default namespace
+    identifier = node_id_str
+    
+    if 'ns=' in node_id_str:
+        ns_match = re.search(r'ns=(\d+)', node_id_str)
+        if ns_match:
+            ns = int(ns_match.group(1))
+    
+    if ';i=' in node_id_str:
+        id_match = re.search(r';i=(\d+)', node_id_str)
+        if id_match:
+            identifier = int(id_match.group(1))
+    elif ';s=' in node_id_str:
+        id_match = re.search(r';s=(.+)', node_id_str)
+        if id_match:
+            identifier = id_match.group(1)
+    elif node_id_str.startswith('i='):
+        identifier = int(node_id_str[2:])
+    elif node_id_str.startswith('s='):
+        identifier = node_id_str[2:]
+    
+    return ns, identifier
+
+def get_opcua_data_type(data_type_str: str):
+    """Convert string data type to OPC-UA VariantType"""
+    data_type_map = {
+        'Boolean': ua.VariantType.Boolean,
+        'SByte': ua.VariantType.SByte,
+        'Byte': ua.VariantType.Byte,
+        'Int16': ua.VariantType.Int16,
+        'UInt16': ua.VariantType.UInt16,
+        'Int32': ua.VariantType.Int32,
+        'UInt32': ua.VariantType.UInt32,
+        'Int64': ua.VariantType.Int64,
+        'UInt64': ua.VariantType.UInt64,
+        'Float': ua.VariantType.Float,
+        'Double': ua.VariantType.Double,
+        'String': ua.VariantType.String,
+        'DateTime': ua.VariantType.DateTime,
+        'ByteString': ua.VariantType.ByteString,
+    }
+    return data_type_map.get(data_type_str, ua.VariantType.Double)
+
+def coerce_value_for_opcua_type(value, data_type_str: str):
+    """Coerce values to specific OPC-UA types based on mapping"""
+    if value is None:
+        # Return appropriate default based on type
+        defaults = {
+            'Boolean': False,
+            'SByte': 0, 'Byte': 0, 'Int16': 0, 'UInt16': 0, 
+            'Int32': 0, 'UInt32': 0, 'Int64': 0, 'UInt64': 0,
+            'Float': 0.0, 'Double': 0.0,
+            'String': '', 'ByteString': b''
+        }
+        return defaults.get(data_type_str, 0.0)
+    
+    try:
+        if data_type_str == 'Boolean':
+            return bool(value)
+        elif data_type_str in ['SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64']:
+            return int(float(value))  # Convert via float to handle string numbers
+        elif data_type_str in ['Float', 'Double']:
+            return float(value)
+        elif data_type_str == 'String':
+            return str(value)
+        elif data_type_str == 'ByteString':
+            if isinstance(value, str):
+                return value.encode('utf-8')
+            return bytes(value) if value else b''
+        else:
+            return float(value)  # Default to float
+    except (ValueError, TypeError):
+        # Return appropriate default on conversion error
+        defaults = {
+            'Boolean': False,
+            'SByte': 0, 'Byte': 0, 'Int16': 0, 'UInt16': 0, 
+            'Int32': 0, 'UInt32': 0, 'Int64': 0, 'UInt64': 0,
+            'Float': 0.0, 'Double': 0.0,
+            'String': str(value) if value else '', 
+            'ByteString': b''
+        }
+        return defaults.get(data_type_str, 0.0)
+
+def get_access_level(access_level_str: str):
+    """Convert access level string to OPC-UA AccessLevel"""
+    access_map = {
+        'CurrentRead': ua.AccessLevel.CurrentRead,
+        'CurrentWrite': ua.AccessLevel.CurrentWrite,
+        'CurrentReadOrWrite': ua.AccessLevel.CurrentRead | ua.AccessLevel.CurrentWrite,
+        'HistoryRead': ua.AccessLevel.HistoryRead,
+        'HistoryWrite': ua.AccessLevel.HistoryWrite,
+    }
+    return access_map.get(access_level_str, ua.AccessLevel.CurrentRead | ua.AccessLevel.CurrentWrite)
+
+
+async def get_mappings_via_api():
+    """Get OPC-UA mappings via HTTP API to avoid process isolation"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('http://localhost:8080/mappings/opcua') as resp:
+                if resp.status == 200:
+                    mappings = await resp.json()
+                    print(f"OPC-UA: Loaded {len(mappings)} mappings via API")
+                    return mappings
+                else:
+                    print(f"OPC-UA: Failed to load mappings: HTTP {resp.status}")
+                    return {}
+    except Exception as e:
+        print(f"OPC-UA: Error loading mappings: {e}")
+        return {}
+
+async def get_data_via_api():
+    """Get data points via HTTP API to avoid process isolation"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('http://localhost:8080/data') as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    print(f"OPC-UA: Failed to load data: HTTP {resp.status}")
+                    return {}
+    except Exception as e:
+        print(f"OPC-UA: Error loading data: {e}")
+        return {}
+
+async def opcua_server_thread(stop_event: Event):
+    host = os.getenv('SERVER_HOST', '0.0.0.0')
+    port = int(os.getenv('OPCUA_PORT', '4840'))
+    
+    server = Server()
+    await server.init()
+    server.set_endpoint(f"opc.tcp://{host}:{port}")
+    server.set_server_name("DataService OPC-UA Server")
+    
+    # Create namespace
+    uri = "http://dataservice.gateway.io"
+    idx = await server.register_namespace(uri)
+    
+    # Get Objects node
+    objects = server.get_objects_node()
+    
+    # Create folders for organizing nodes
+    data_folder = await objects.add_folder(idx, "SensorData")
+    
+    # Cache for created variables by data_id
+    data_id_to_var = {}
+    node_id_to_var = {}
+    key_to_data_type = {}
+    
+    print(f"OPC-UA server starting on {host}:{port}")
+    
+    async with server:
+        print(f"✓ OPC-UA server started successfully on {host}:{port}")
+        
+        while not stop_event.is_set():
+            try:
+                # Get all current mappings via API
+                all_mappings = await get_mappings_via_api()
+                
+                # Create/update variables based on mappings
+                for data_id, mapping in all_mappings.items():
+                    try:
+                        key = mapping['key']
+                        node_id_str = mapping['node_id']
+                        browse_name = mapping.get('browse_name', key)
+                        display_name = mapping.get('display_name', key)
+                        data_type = mapping.get('data_type', 'Double')
+                        access_level = mapping.get('access_level', 'CurrentReadOrWrite')
+                        description = mapping.get('description', '')
+                        
+                        # Create variable if it doesn't exist
+                        if data_id not in data_id_to_var:
+                            # Parse node ID
+                            ns, identifier = parse_node_id(node_id_str)
+                            
+                            # Get current value from datastore via API
+                            data_snapshot = await get_data_via_api()
+                            current_value = data_snapshot.get(key, 0.0)
+                            print(f"OPC-UA: Got value for {key}: {current_value}")
+                            coerced_value = coerce_value_for_opcua_type(current_value, data_type)
+                            
+                            # Create the variable
+                            if isinstance(identifier, int):
+                                node_id = ua.NodeId(identifier, ns)
+                            else:
+                                node_id = ua.NodeId(identifier, ns)
+                            
+                            var = await data_folder.add_variable(
+                                node_id,
+                                browse_name,
+                                coerced_value,
+                                get_opcua_data_type(data_type)
+                            )
+                            
+                            # Set properties
+                            await var.set_display_name(ua.LocalizedText(display_name))
+                            await var.set_access_level(get_access_level(access_level))
+                            
+                            # Set writable if access allows writing
+                            if 'Write' in access_level:
+                                await var.set_writable(True)
+                            
+                            # Add description
+                            if description:
+                                await var.set_description(ua.LocalizedText(description))
+                            
+                            # Cache the variable
+                            data_id_to_var[data_id] = var
+                            node_id_to_var[node_id_str] = var
+                            key_to_data_type[key] = data_type
+                            
+                            print(f"OPC-UA created mapped variable: {key} -> {node_id_str} ({data_type})")
+                        
+                        # Update variable value
+                        var = data_id_to_var.get(data_id)
+                        if var is not None:
+                            data_snapshot = await get_data_via_api()
+                            current_value = data_snapshot.get(key, 0.0)
+                            expected_type = key_to_data_type.get(key, 'Double')
+                            coerced_value = coerce_value_for_opcua_type(current_value, expected_type)
+                            
+                            try:
+                                await var.set_value(coerced_value)
+                            except Exception as e:
+                                print(f"OPC-UA set value error for {key}: {e}")
+                                
+                    except Exception as e:
+                        print(f"OPC-UA mapping error for data_id {data_id}: {e}")
+                
+                # Handle write operations back to datastore
+                # Note: This is a simplified approach. In a production system, 
+                # you'd want to set up proper write callbacks
+                for data_id, var in data_id_to_var.items():
+                    try:
+                        # Get mapping info
+                        mapping = all_mappings.get(data_id)
+                        if mapping and 'Write' in mapping.get('access_level', ''):
+                            key = mapping['key']
+                            # Get current OPC-UA value
+                            current_opcua_value = await var.get_value()
+                            # Compare with datastore via API and update if different
+                            data_snapshot = await get_data_via_api()
+                            datastore_value = data_snapshot.get(key, 0.0)
+                            
+                            # Only update if values are significantly different
+                            if current_opcua_value != datastore_value:
+                                # This is where you'd normally check if the OPC-UA value
+                                # was written by a client, but for simplicity we're
+                                # assuming the datastore is the source of truth
+                                pass
+                                
+                    except Exception as e:
+                        # Ignore read errors on variables
+                        pass
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                print(f"OPC-UA update error: {e}")
+                await asyncio.sleep(1)
+                
+    print("OPC-UA server stopped")

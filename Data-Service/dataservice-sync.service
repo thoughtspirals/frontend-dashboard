@@ -1,0 +1,19 @@
+[Unit]
+Description=Data-Service Sync - Syncs polling data to Data-Service via IPC
+After=network.target
+Wants=dataservice.service
+
+[Service]
+Type=simple
+User=ach1lles
+Group=ach1lles
+WorkingDirectory=/home/ach1lles/Projects/IOT-GATEWAY/Data-Service
+Environment="PATH=/home/ach1lles/Projects/IOT-GATEWAY/Data-Service/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/ach1lles/Projects/IOT-GATEWAY/Data-Service/venv/bin/python /home/ach1lles/Projects/IOT-GATEWAY/Data-Service/sync_runner.py --socket-path /tmp/dataservice.sock --interval 1.0
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ach1lles/Projects/IOT-GATEWAY/Data-Service/logs/dataservice-sync.log
+StandardError=append:/home/ach1lles/Projects/IOT-GATEWAY/Data-Service/logs/dataservice-sync.log
+
+[Install]
+WantedBy=multi-user.target

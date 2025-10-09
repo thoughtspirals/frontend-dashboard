@@ -1,0 +1,206 @@
+import os
+import asyncio
+from dotenv import load_dotenv
+from asyncua import Server, ua
+from ..core.datastore import DATA_STORE
+from ..core.mapping_store import OPCUA_MAPPING
+from threading import Event
+
+# Load environment variables
+load_dotenv()
+
+def coerce_value_for_opcua(value):
+    """Coerce values to appropriate OPC-UA types"""
+    if value is None:
+        return 0.0
+    elif isinstance(value, bool):
+        return bool(value)  # Keep as boolean
+    elif isinstance(value, int):
+        return int(value)  # Keep as int32
+    elif isinstance(value, float):
+        return float(value)  # Keep as double
+    elif isinstance(value, str):
+        try:
+            # Try to parse as number first
+            if '.' in value:
+                return float(value)
+            else:
+                return int(value)
+        except ValueError:
+            return str(value)  # Keep as string
+    else:
+        return str(value)  # Convert to string as fallback
+
+def parse_node_id(node_id_str: str, default_namespace: int = 2):
+    """Parse a node ID string like 'ns=2;s=MyNode' or just 'MyNode'"""
+    if not node_id_str:
+        return None
+    
+    # If it already contains namespace info, use as-is
+    if 'ns=' in node_id_str or 'i=' in node_id_str or 'g=' in node_id_str or 'b=' in node_id_str:
+        return node_id_str
+    
+    # Otherwise, assume it's a string identifier in the default namespace
+    return f"ns={default_namespace};s={node_id_str}"
+
+async def opcua_server_thread(stop_event: Event):
+    host = os.getenv('SERVER_HOST', '0.0.0.0')
+    port = int(os.getenv('OPCUA_PORT', '4840'))
+    
+    server = Server()
+    await server.init()
+    server.set_endpoint(f"opc.tcp://{host}:{port}")
+    server.set_server_name("DataService OPC-UA Server")
+    
+    # Create namespace
+    uri = "http://dataservice.gateway.io"
+    idx = await server.register_namespace(uri)
+    
+    # Get Objects node
+    objects = server.get_objects_node()
+    
+    # Create a folder for our data
+    data_folder = await objects.add_folder(idx, "SensorData")
+    
+    # Variable cache by key and by node_id
+    key_to_var = {}
+    node_id_to_var = {}
+    key_to_type = {}
+    
+    print(f"OPC-UA server starting on {host}:{port}")
+    print(f"Using namespace {idx}: {uri}")
+    
+    async with server:
+        print(f"✓ OPC-UA server started successfully on {host}:{port}")
+        
+        # Initialize nodes from mappings first
+        mappings = OPCUA_MAPPING.all()
+        print(f"Found {len(mappings)} OPC-UA mappings to initialize")
+        
+        for data_id, mapping in mappings.items():
+            try:
+                key = mapping.get('key')
+                node_id_raw = mapping.get('node_id')
+                browse_name = mapping.get('browse_name', key)
+                display_name = mapping.get('display_name', key)
+                
+                if not key or not node_id_raw:
+                    print(f"Skipping invalid mapping {data_id}: missing key or node_id")
+                    continue
+                
+                # Parse the node_id to ensure proper format
+                node_id_str = parse_node_id(node_id_raw, idx)
+                node_id = ua.NodeId.from_string(node_id_str)
+                
+                # Get current value from data store
+                current_value = DATA_STORE.snapshot().get(key, 0)
+                coerced_value = coerce_value_for_opcua(current_value)
+                
+                # Create the variable with the specific NodeId
+                var = await data_folder.add_variable(
+                    node_id,
+                    browse_name,
+                    coerced_value
+                )
+                
+                # Set display name if different from browse name
+                if display_name != browse_name:
+                    await var.set_display_name(ua.LocalizedText(display_name))
+                
+                # Set writable based on access level
+                access_level = mapping.get('access_level', 'CurrentRead')
+                if 'Write' in access_level:
+                    await var.set_writable()
+                
+                # Cache the variable
+                key_to_var[key] = var
+                node_id_to_var[node_id_str] = var
+                key_to_type[key] = type(coerced_value)
+                
+                print(f"✓ Created OPC-UA variable: {key} -> {node_id_str} = {coerced_value}")
+                
+            except Exception as e:
+                print(f"✗ Failed to create variable for mapping {data_id}: {e}")
+        
+        # Main update loop
+        while not stop_event.is_set():
+            try:
+                # Get all current data
+                snapshot = DATA_STORE.snapshot()
+                
+                for key, value in snapshot.items():
+                    # Check if we have a mapping for this key
+                    var = key_to_var.get(key)
+                    
+                    if var is None:
+                        # Check if there's a mapping for this key that we haven't created yet
+                        mapping = OPCUA_MAPPING.find_by_key(key)
+                        if mapping:
+                            try:
+                                node_id_raw = mapping.get('node_id')
+                                browse_name = mapping.get('browse_name', key)
+                                display_name = mapping.get('display_name', key)
+                                
+                                if node_id_raw:
+                                    node_id_str = parse_node_id(node_id_raw, idx)
+                                    node_id = ua.NodeId.from_string(node_id_str)
+                                    
+                                    coerced_value = coerce_value_for_opcua(value)
+                                    var = await data_folder.add_variable(
+                                        node_id,
+                                        browse_name,
+                                        coerced_value
+                                    )
+                                    
+                                    if display_name != browse_name:
+                                        await var.set_display_name(ua.LocalizedText(display_name))
+                                    
+                                    access_level = mapping.get('access_level', 'CurrentRead')
+                                    if 'Write' in access_level:
+                                        await var.set_writable()
+                                    
+                                    key_to_var[key] = var
+                                    node_id_to_var[node_id_str] = var
+                                    key_to_type[key] = type(coerced_value)
+                                    
+                                    print(f"✓ Dynamically created OPC-UA variable: {key} -> {node_id_str} = {coerced_value}")
+                            except Exception as e:
+                                print(f"✗ Failed to dynamically create variable for {key}: {e}")
+                        else:
+                            # No mapping found - create with auto-generated NodeId as fallback
+                            try:
+                                coerced_value = coerce_value_for_opcua(value)
+                                var = await data_folder.add_variable(idx, key, coerced_value)
+                                await var.set_writable()
+                                key_to_var[key] = var
+                                key_to_type[key] = type(coerced_value)
+                                print(f"⚠ Created unmapped OPC-UA variable: {key} = {coerced_value} (auto-generated NodeId)")
+                            except Exception as e:
+                                print(f"✗ Failed to create unmapped variable for {key}: {e}")
+                                continue
+                    
+                    # Update variable value if we have one
+                    if var is not None:
+                        try:
+                            # Coerce value to the type we established for this variable
+                            expected_type = key_to_type.get(key, type(value))
+                            if expected_type == float:
+                                new_value = float(value) if value is not None else 0.0
+                            elif expected_type == int:
+                                new_value = int(value) if value is not None else 0
+                            elif expected_type == bool:
+                                new_value = bool(value) if value is not None else False
+                            else:
+                                new_value = str(value) if value is not None else ""
+                            
+                            await var.set_value(new_value)
+                        except Exception as e:
+                            print(f"✗ Failed to update value for {key}: {e}")
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                print(f"OPC-UA update error: {e}")
+                await asyncio.sleep(1)
+                
+    print("OPC-UA server stopped")

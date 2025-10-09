@@ -1,0 +1,8 @@
+asyncua
+pyModbusTCP
+pysnmp
+c104
+paho-mqtt
+fastapi
+uvicorn
+python-dotenv
